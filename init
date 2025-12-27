@@ -1,0 +1,97 @@
+#!/bin/sh
+
+set +e
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+export PATH
+
+BB=/bin/busybox
+
+SERIAL=/dev/ttyS0
+ROOT_DEV=/dev/mmcblk0p10
+ONBOARD_DEV=/dev/mmcblk0p12
+
+PUSH_DEV=/dev/input/event1
+ONBOARD_MNT=/mnt/onboard
+NEWROOT=/mnt/newroot
+IMAGE_PATH=.buildroot/buildroot-kobo.img
+
+BUILDROOT_ATTEMPTED=0
+
+log() {
+  echo "kobo-init: $*"
+}
+
+cleanup() {
+  umount -l "$NEWROOT" >/dev/null 2>&1 || umount "$NEWROOT" >/dev/null 2>&1 || :
+  umount -l "$ONBOARD_MNT" >/dev/null 2>&1 || umount "$ONBOARD_MNT" >/dev/null 2>&1 || :
+}
+
+push_detected() {
+  log "checking for push event on $PUSH_DEV (max 10s)"
+  i=0
+  while [ ! -e "$PUSH_DEV" ] && [ $i -lt 50 ]; do
+    "$BB" sleep 0.2 2>/dev/null || sleep 0.2
+    i=$((i + 1))
+  done
+  [ -e "$PUSH_DEV" ] || return 1
+
+  "$BB" timeout -s TERM 10 "$BB" dd if="$PUSH_DEV" of=/dev/null bs=24 count=1 >/dev/null 2>&1
+  [ $? -eq 0 ]
+}
+
+try_boot() {
+  [ -w /tmp ] || return 1
+
+  mkdir -p /proc /sys /dev /tmp /mnt /dev/input "$ONBOARD_MNT" "$NEWROOT" >/dev/null 2>&1 || return 1
+  mount -t proc proc /proc 2>/dev/null || :
+  mount -t sysfs sysfs /sys 2>/dev/null || :
+  mount -t devtmpfs devtmpfs /dev 2>/dev/null || :
+  mount -o remount,noatime,nodiratime "$ROOT_DEV" / 2>/dev/null || :
+  mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /tmp 2>/dev/null || :
+
+  [ -b "$ONBOARD_DEV" ] || return 1
+  mount -t vfat -o rw,noatime,nodiratime,shortname=mixed,utf8 "$ONBOARD_DEV" "$ONBOARD_MNT" >/dev/null 2>&1 || return 1
+
+  img="$ONBOARD_MNT/$IMAGE_PATH"
+  [ -f "$img" ] || return 1
+
+  mount -t ext4 -o loop,rw "$img" "$NEWROOT" >/dev/null 2>&1 || :
+  mountpoint -q "$NEWROOT" 2>/dev/null || \
+    mount -t ext4 -o loop,ro "$img" "$NEWROOT" >/dev/null 2>&1 || return 1
+
+  [ -x "$NEWROOT/sbin/init" ] || return 1
+
+  mkdir -p "$NEWROOT/.oldroot" "$NEWROOT/proc" "$NEWROOT/sys" "$NEWROOT/dev" >/dev/null 2>&1 || return 1
+  cd "$NEWROOT" 2>/dev/null || return 1
+  pivot_root . .oldroot >/dev/null 2>&1 || return 1
+
+  cd / 2>/dev/null || :
+  mount --move /.oldroot/dev /dev 2>/dev/null || :
+  mount --move /.oldroot/proc /proc 2>/dev/null || :
+  mount --move /.oldroot/sys /sys 2>/dev/null || :
+  umount -l /.oldroot 2>/dev/null || :
+  exec /sbin/init
+}
+
+main() {
+  if [ -c "$SERIAL" ]; then
+    exec >"$SERIAL" 2>&1
+  elif [ -e /dev/kmsg ]; then
+    exec >/dev/kmsg 2>&1
+  elif [ -e /dev/console ]; then
+    exec >/dev/console 2>&1
+  fi
+
+  trap 'if [ "$BUILDROOT_ATTEMPTED" -eq 1 ]; then cleanup; fi; exec "$BB" init "$@"' 0
+
+  log "starting"
+  if push_detected; then
+    log "push detected"
+    BUILDROOT_ATTEMPTED=1
+    try_boot || { log "alternative boot failed"; cleanup; }
+  fi
+  exec "$BB" init "$@"
+}
+
+main "$@"
