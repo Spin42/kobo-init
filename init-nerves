@@ -97,6 +97,9 @@ try_boot() {
     mount --move /.oldroot/sys /sys
 
     log "cleanup old root"
+    mkdir -p /mnt/onboard
+    mount --move /.oldroot/mnt/onboard /mnt/onboard
+    # Now clean up the old root (but onboard is preserved)
     umount -l /.oldroot 2>/dev/null || :
 
     log "exec /sbin/init"
